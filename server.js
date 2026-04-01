@@ -59,12 +59,7 @@ function uniqueBy(items, keyFn) {
 }
 
 async function clickSearchButton(page) {
-  const selectors = [
-    'button',
-    'input[type="submit"]',
-    'input[type="button"]',
-    'a',
-  ];
+  const selectors = ['button', 'input[type="submit"]', 'input[type="button"]', 'a'];
 
   for (const selector of selectors) {
     const locator = page.locator(selector);
@@ -133,8 +128,7 @@ async function tryFillDate(page, date) {
     const type = (await input.getAttribute('type').catch(() => '')) || '';
     const name = (await input.getAttribute('name').catch(() => '')) || '';
     const id = (await input.getAttribute('id').catch(() => '')) || '';
-    const placeholder =
-      (await input.getAttribute('placeholder').catch(() => '')) || '';
+    const placeholder = (await input.getAttribute('placeholder').catch(() => '')) || '';
 
     const meta = `${type} ${name} ${id} ${placeholder}`.toLowerCase();
 
@@ -152,6 +146,7 @@ async function tryFillDate(page, date) {
 async function scrapeDutyNotaries({ city, date }) {
   const browser = await chromium.launch({
     headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
   const context = await browser.newContext({
@@ -244,7 +239,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     message: 'noter-duty-service çalışıyor',
-    mode: 'playwright',
+    mode: 'playwright-docker',
   });
 });
 
@@ -252,7 +247,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     service: 'noter-duty-service',
-    mode: 'playwright',
+    mode: 'playwright-docker',
     timestamp: new Date().toISOString(),
   });
 });
