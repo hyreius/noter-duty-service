@@ -1,7 +1,7 @@
 {
   "name": "noter-duty-service",
   "version": "2.0.0",
-  "description": "Duty notary service with Playwright",
+  "description": "Duty notary service with Playwright Docker",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
