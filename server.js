@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const { chromium } = require('playwright');
 
 const app = express();
 
@@ -12,14 +11,7 @@ const PORT = process.env.PORT || 3000;
 const TNB_URL = 'https://portal.tnb.org.tr/Sayfalar/NobetciNoterBul.aspx';
 
 function normalizeText(value = '') {
-  return String(value)
-    .replace(/\s+/g, ' ')
-    .replace(/\u00a0/g, ' ')
-    .trim();
-}
-
-function normalizeCity(value = '') {
-  return normalizeText(value).toUpperCase();
+  return String(value).replace(/\s+/g, ' ').replace(/\u00a0/g, ' ').trim();
 }
 
 function parseDateInput(dateStr) {
@@ -28,15 +20,12 @@ function parseDateInput(dateStr) {
   const parts = String(dateStr).split('-');
   if (parts.length !== 3) return null;
 
-  const year = parts[0];
-  const month = parts[1];
-  const day = parts[2];
-
+  const [year, month, day] = parts;
   if (!year || !month || !day) return null;
 
   return {
     iso: `${year}-${month}-${day}`,
-    trSlash: `${day}/${month}/${year}`,
+    trSlash: `${day}.${month}.${year}`,
   };
 }
 
@@ -52,140 +41,220 @@ function extractHours(text = '') {
   return match ? normalizeText(match[1].replace(/\./g, ':')) : '';
 }
 
-function collectCandidateBlocks($) {
-  const blocks = [];
-
-  $('table tr').each((_, el) => {
-    const lines = [];
-
-    $(el)
-      .find('td')
-      .each((__, td) => {
-        const txt = normalizeText($(td).text());
-        if (txt) lines.push(txt);
-      });
-
-    if (lines.length >= 2) {
-      blocks.push(lines.join(' | '));
-    }
-  });
-
-  $('div, li').each((_, el) => {
-    const txt = normalizeText($(el).text());
-    if (!txt) return;
-    if (!/noter/i.test(txt)) return;
-    if (txt.length < 20 || txt.length > 1500) return;
-    blocks.push(txt);
-  });
-
-  return blocks;
-}
-
-function parseNotaryBlock(rawText, city) {
-  const text = normalizeText(rawText);
-  if (!text) return null;
-
-  const lines = text
-    .split(/\||\n/)
-    .map((x) => normalizeText(x))
-    .filter(Boolean);
-
-  const title = lines.find((x) => /noter/i.test(x)) || '';
-  if (!title) return null;
-
-  const phone = extractPhone(text);
-  const hours = extractHours(text);
-
-  let isOpen = null;
-  if (/açık/i.test(text)) isOpen = true;
-  if (/kapalı/i.test(text)) isOpen = false;
-
-  const addressParts = lines.filter((x) => {
-    if (x === title) return false;
-    if (/açık|kapalı/i.test(x)) return false;
-    if (/\d{2}[:.]\d{2}\s*[-–]\s*\d{2}[:.]\d{2}/.test(x)) return false;
-    if (/^\+?90/.test(x)) return false;
-    if (/^0\d{3}/.test(x)) return false;
-    return true;
-  });
-
-  const address = normalizeText(addressParts.join(' '));
-
-  const haystack = normalizeCity(`${title} ${address} ${text}`);
-  if (city && !haystack.includes(normalizeCity(city))) {
-    return null;
-  }
-
-  return {
-    title,
-    city,
-    address,
-    phone,
-    hours,
-    isOpen,
-    source: 'TNB',
-  };
-}
-
-function uniqueNotaries(items) {
+function uniqueBy(items, keyFn) {
   const seen = new Set();
-  const result = [];
+  const out = [];
 
   for (const item of items) {
-    if (!item || !item.title) continue;
-
-    const key = `${normalizeCity(item.title)}|${normalizeCity(item.address || '')}`;
-    if (seen.has(key)) continue;
-
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
     seen.add(key);
-    result.push(item);
+    out.push(item);
   }
 
-  return result;
+  return out;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function scrapeDutyNotaries({ city, date }) {
+  const browser = await chromium.launch({
+    headless: true,
+  });
 
-async function fetchTnbPage() {
-  let lastError = null;
+  const context = await browser.newContext({
+    locale: 'tr-TR',
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  });
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await axios.get(TNB_URL, {
-        timeout: 60000,
-        maxRedirects: 5,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          Connection: 'keep-alive',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-        },
+  const page = await context.newPage();
+
+  try {
+    await page.goto(TNB_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    });
+
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+
+    // Sayfada şehir / tarih alanlarını olabildiğince esnek bulmaya çalışıyoruz.
+    const citySelectors = [
+      'select',
+      '[name*="Il"]',
+      '[id*="Il"]',
+      '[name*="il"]',
+      '[id*="il"]'
+    ];
+
+    const dateSelectors = [
+      'input[type="date"]',
+      'input',
+      '[name*="Tarih"]',
+      '[id*="Tarih"]',
+      '[name*="tarih"]',
+      '[id*="tarih"]'
+    ];
+
+    // Şehir select'i bul
+    let citySet = false;
+    for (const selector of citySelectors) {
+      const count = await page.locator(selector).count();
+      for (let i = 0; i < count; i++) {
+        const loc = page.locator(selector).nth(i);
+        const tagName = await loc.evaluate((el) => el.tagName.toLowerCase()).catch(() => '');
+        if (tagName !== 'select') continue;
+
+        const optionsText = await loc.locator('option').allTextContents().catch(() => []);
+        const hasCity = optionsText.some((x) =>
+          normalizeText(x).toLowerCase().includes(city.toLowerCase())
+        );
+
+        if (hasCity) {
+          await loc.selectOption({ label: city }).catch(async () => {
+            const options = await loc.locator('option').all();
+            for (const option of options) {
+              const txt = normalizeText(await option.textContent());
+              if (txt.toLowerCase() === city.toLowerCase()) {
+                const value = await option.getAttribute('value');
+                if (value) {
+                  await loc.selectOption(value);
+                  return;
+                }
+              }
+            }
+          });
+          citySet = true;
+          break;
+        }
+      }
+      if (citySet) break;
+    }
+
+    // Tarih alanını bul ve doldur
+    let dateSet = false;
+    for (const selector of dateSelectors) {
+      const count = await page.locator(selector).count();
+
+      for (let i = 0; i < count; i++) {
+        const loc = page.locator(selector).nth(i);
+
+        const tagName = await loc.evaluate((el) => el.tagName.toLowerCase()).catch(() => '');
+        if (tagName !== 'input') continue;
+
+        const type = await loc.getAttribute('type').catch(() => '');
+        const name = (await loc.getAttribute('name').catch(() => '')) || '';
+        const id = (await loc.getAttribute('id').catch(() => '')) || '';
+        const placeholder = (await loc.getAttribute('placeholder').catch(() => '')) || '';
+
+        const meta = `${name} ${id} ${placeholder}`.toLowerCase();
+
+        if (type === 'date' || meta.includes('tarih')) {
+          await loc.fill(date.iso).catch(async () => {
+            await loc.fill(date.trSlash);
+          });
+          dateSet = true;
+          break;
+        }
+      }
+
+      if (dateSet) break;
+    }
+
+    // Sorgula / ara butonunu bul
+    const buttonCandidates = [
+      'button',
+      'input[type="submit"]',
+      'input[type="button"]',
+      'a'
+    ];
+
+    let clicked = false;
+
+    for (const selector of buttonCandidates) {
+      const count = await page.locator(selector).count();
+
+      for (let i = 0; i < count; i++) {
+        const loc = page.locator(selector).nth(i);
+        const txt = normalizeText(await loc.textContent().catch(() => ''));
+        const value = normalizeText(await loc.getAttribute('value').catch(() => ''));
+        const allText = `${txt} ${value}`.toLowerCase();
+
+        if (
+          allText.includes('ara') ||
+          allText.includes('sorgula') ||
+          allText.includes('listele') ||
+          allText.includes('bul')
+        ) {
+          await loc.click({ timeout: 10000 }).catch(() => {});
+          clicked = true;
+          break;
+        }
+      }
+
+      if (clicked) break;
+    }
+
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+
+    const rawBlocks = await page.evaluate(() => {
+      const texts = [];
+      const selectors = ['table tr', 'div', 'li'];
+
+      selectors.forEach((selector) => {
+        document.querySelectorAll(selector).forEach((el) => {
+          const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+          if (text && /noter/i.test(text) && text.length > 20 && text.length < 2000) {
+            texts.push(text);
+          }
+        });
       });
 
-      return response.data;
-    } catch (error) {
-      lastError = error;
-      console.error(`TNB fetch deneme ${attempt} başarısız:`, error.message);
+      return texts;
+    });
 
-      if (attempt < 3) {
-        await sleep(2000);
-      }
-    }
+    const parsed = rawBlocks.map((text) => {
+      const lines = text
+        .split(/\n|\|/)
+        .map((x) => normalizeText(x))
+        .filter(Boolean);
+
+      const title = lines.find((x) => /noter/i.test(x)) || '';
+      if (!title) return null;
+
+      const address = lines
+        .filter(
+          (x) =>
+            x !== title &&
+            !/açık|kapalı/i.test(x) &&
+            !/\d{2}[:.]\d{2}\s*[-–]\s*\d{2}[:.]\d{2}/.test(x) &&
+            !/^\+?90/.test(x) &&
+            !/^0\d{3}/.test(x)
+        )
+        .join(' ');
+
+      return {
+        title,
+        city,
+        address: normalizeText(address),
+        phone: extractPhone(text),
+        hours: extractHours(text),
+        isOpen: /açık/i.test(text) ? true : /kapalı/i.test(text) ? false : null,
+        source: 'TNB'
+      };
+    }).filter(Boolean);
+
+    return uniqueBy(parsed, (x) => `${x.title}|${x.address}`);
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
-
-  throw lastError;
 }
 
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     message: 'noter-duty-service çalışıyor',
+    mode: 'playwright'
   });
 });
 
@@ -193,7 +262,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     service: 'noter-duty-service',
-    timestamp: new Date().toISOString(),
+    mode: 'playwright',
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -205,43 +275,35 @@ app.get('/api/duty-notaries', async (req, res) => {
     if (!city) {
       return res.status(400).json({
         ok: false,
-        message: 'city parametresi zorunlu.',
+        message: 'city parametresi zorunlu.'
       });
     }
 
     if (!date) {
       return res.status(400).json({
         ok: false,
-        message: 'date parametresi YYYY-MM-DD formatında zorunlu.',
+        message: 'date parametresi YYYY-MM-DD formatında zorunlu.'
       });
     }
 
-    const html = await fetchTnbPage();
-    const $ = cheerio.load(html);
-    const blocks = collectCandidateBlocks($);
+    const data = await scrapeDutyNotaries({ city, date });
 
-    const parsed = uniqueNotaries(
-      blocks.map((block) => parseNotaryBlock(block, city)).filter(Boolean)
-    );
-
-    return res.json({
+    res.json({
       ok: true,
       city,
       date: date.iso,
       requestedDateDisplay: date.trSlash,
       source: TNB_URL,
-      count: parsed.length,
-      data: parsed,
-      note:
-        'Bu sürüm şehir+tarih parametresiyle çalışır. TNB sayfa yapısı değişirse parser güncellenmelidir.',
+      count: data.length,
+      data
     });
   } catch (error) {
     console.error('Duty notaries error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
       message: 'TNB verisi alınamadı.',
-      error: error.message,
+      error: error.message
     });
   }
 });
