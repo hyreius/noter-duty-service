@@ -1,7 +1,7 @@
 {
   "name": "noter-duty-service",
-  "version": "1.0.0",
-  "description": "Duty notary proxy service for Flutter app",
+  "version": "2.0.0",
+  "description": "Duty notary service with Playwright",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -11,9 +11,8 @@
     "node": "18.x"
   },
   "dependencies": {
-    "axios": "^1.7.7",
-    "cheerio": "^1.0.0",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "playwright": "^1.58.2"
   }
 }
